@@ -1,5 +1,6 @@
 import torch
-from torch.optim import Adam
+import math
+from torch.optim import Adam, SGD
 from torch.autograd import Variable
 from torch.distributions import Uniform
 import torch.nn.functional as F
@@ -30,18 +31,16 @@ def compute_eltwise_huber_quantile_loss(actions, target_actions, taus, weighting
 
 
 class Generative(Policy):
-    def __init__(self, gamma, tau, num_inputs, action_space, replay_size, normalize_obs=False, normalize_returns=False,
-                 num_basis_functions=64, num_outputs=1, use_value=True, q_normalization=0.01, target_policy='linear',
-                 target_policy_q='min', autoregressive=True, temp=1.0):
+    def __init__(self, gamma, tau, num_inputs, action_space, replay_size, num_basis_functions=64, actor_samples=1,
+                 q_normalization=0.01, target_policy='linear', target_policy_q='min', autoregressive=True, temp=1.0):
 
         super(Generative, self).__init__(gamma=gamma, tau=tau, num_inputs=num_inputs, action_space=action_space,
-                                         replay_size=replay_size, normalize_obs=normalize_obs,
-                                         normalize_returns=normalize_returns)
+                                         replay_size=replay_size)
 
-        self.num_outputs = num_outputs
+        self.actor_samples = actor_samples
+        self.topk = math.ceil(self.actor_samples * 0.7)
         self.num_basis_functions = num_basis_functions
         self.action_dim = self.action_space.shape[0]
-        self.use_value = use_value
         self.q_normalization = q_normalization
         self.target_policy = target_policy
         self.autoregressive = autoregressive
@@ -51,8 +50,10 @@ class Generative(Policy):
             self.target_policy_q = lambda x, y: torch.min(x, y)
         elif target_policy_q == 'max':
             self.target_policy_q = lambda x, y: torch.max(x, y)
-        else:
+        elif target_policy_q == 'mean':
             self.target_policy_q = lambda x, y: (x + y / 2)
+        else:
+            self.target_policy_q = lambda x, y: x
 
         self.tau_sampler = Uniform(self.Tensor([0.0]), self.Tensor([1.0]))
 
@@ -63,12 +64,10 @@ class Generative(Policy):
         if self.autoregressive:
             self.actor = AutoRegressiveStochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
             self.actor_target = AutoRegressiveStochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
-            self.actor_perturbed = AutoRegressiveStochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
         else:
             self.actor = StochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
             self.actor_target = StochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
-            self.actor_perturbed = StochasticActor(self.num_inputs, self.action_dim, self.num_basis_functions).to(self.device)
-        self.actor_optim = Adam(self.actor.parameters(), lr=1e-3)
+        self.actor_optim = Adam(self.actor.parameters(), lr=1e-4)
 
         self.critic = Critic(self.num_inputs + self.action_dim, num_networks=2).to(self.device)
         self.critic_target = Critic(self.num_inputs + self.action_dim, num_networks=2).to(self.device)
@@ -84,7 +83,6 @@ class Generative(Policy):
         if torch.cuda.device_count() > 1:
             self.actor = torch.nn.DataParallel(self.actor)
             self.actor_target = torch.nn.DataParallel(self.actor_target)
-            self.actor_perturbed = torch.nn.DataParallel(self.actor_perturbed)
 
             self.critic = torch.nn.DataParallel(self.critic)
             self.critic_target = torch.nn.DataParallel(self.critic_target)
@@ -116,7 +114,10 @@ class Generative(Policy):
             The action is modeled as an auto-regressive distribution, e.g.,
             P(X) = P(x_0) * P(x_1 | x_0) * ... * P(x_n | x_{n-1}, ..., x_0)
         '''
-        taus = self.tau_sampler.rsample((batch_size, self.action_dim)).view(batch_size, self.action_dim, 1)
+        if self.autoregressive:
+            taus = self.tau_sampler.rsample((batch_size, self.action_dim)).view(batch_size, self.action_dim, 1)
+        else:
+            taus = self.tau_sampler.rsample((batch_size, 1)).view(batch_size, 1, 1)
         return actor(state, taus, actions), None, taus
 
     def update_critic(self, state_batch, action_batch, reward_batch, mask_batch, next_state_batch):
@@ -127,36 +128,36 @@ class Generative(Policy):
         '''
         with torch.no_grad():
             # the value is calculated based on multiple samples from the policy and evaluated using the Q networks
-            tiled_next_state_batch = self._tile(next_state_batch, 0, self.num_outputs)
-            tiled_next_action_batch = self.policy(self.actor_target, tiled_next_state_batch)[0].view(batch_size * self.num_outputs, -1)
+            tiled_next_state_batch = self._tile(next_state_batch, 0, self.actor_samples)
+            tiled_next_action_batch = self.policy(self.actor_target, tiled_next_state_batch)[0].view(batch_size * self.actor_samples, -1)
 
             next_q1, next_q2 = self.critic_target(torch.cat((tiled_next_state_batch, tiled_next_action_batch), 1))
 
             # to avoid over-estimation, we use the minimal value calculated between both Q networks
-            next_v = torch.min(
-                next_q1.view(batch_size, self.num_outputs).mean(-1).unsqueeze(-1),
-                next_q2.view(batch_size, self.num_outputs).mean(-1).unsqueeze(-1)
+            next_v = self.target_policy_q(
+                (torch.topk(next_q1.view(batch_size, self.actor_samples), self.topk)[0]).mean(-1).unsqueeze(-1),
+                (torch.topk(next_q2.view(batch_size, self.actor_samples), self.topk)[0]).mean(-1).unsqueeze(-1)
             )
+        v = self.value(state_batch)
+        value_loss = F.mse_loss(v, next_v)
 
-        if self.use_value:
-            v = self.value(next_state_batch)
-            value_loss = F.mse_loss(v, next_v)
+        with torch.no_grad():
+            next_v = self.value_target(next_state_batch)
+            target_q = reward_batch + self.gamma * mask_batch * next_v
 
-            self.value_optim.zero_grad()
-            value_loss.backward()
-            self.value_optim.step()
-        else:
-            value_loss = torch.Tensor([0])
+        self.value_optim.zero_grad()
+        value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value.parameters(), 5.0)
+        self.value_optim.step()
 
         '''
             Update Q networks
         '''
-        with torch.no_grad():
-            if self.use_value:
-                next_v = self.value_target(next_state_batch)
-            target_q = reward_batch + self.gamma * mask_batch * next_v
 
         # Add regularization for the Q function. Similar actions should result in similar Q values.
+        # noise = (torch.randn_like(action_batch) * self.q_normalization).clamp(-0.5, 0.5)
+        # action_batch = (action_batch + noise).clamp(-1, 1)
+
         noise = (self.tau_sampler.rsample((batch_size, self.action_dim)).view(batch_size, self.action_dim) * 2 - 1) * self.q_normalization
         action_batch = (action_batch + noise).clamp(-1, 1)
 
@@ -167,28 +168,18 @@ class Generative(Policy):
 
         self.critic_optim.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
         self.critic_optim.step()
 
         return critic_loss.item() + value_loss.item()
 
-    def update_actor(self, state_batch):
+    def update_actor(self, state_batch, action_batch):
         batch_size = state_batch.shape[0]
-        tiled_state_batch = self._tile(state_batch, 0, self.num_outputs)
+        tiled_state_batch = self._tile(state_batch, 0, self.actor_samples)
 
         with torch.no_grad():
             # Calculate the value of each state
-            if self.use_value:
-                values = self.value_target(state_batch)
-            else:
-                actions = self.policy(self.actor, tiled_state_batch)[0]
-                q1, q2 = self.critic_target(torch.cat((tiled_state_batch, actions), 1))
-
-                # to avoid over-estimation, we use the minimal value calculated between both Q networks
-                values = torch.min(
-                    q1.view(batch_size, self.num_outputs).mean(-1).unsqueeze(-1),
-                    q2.view(batch_size, self.num_outputs).mean(-1).unsqueeze(-1)
-                )
-
+            values = self.value_target(state_batch)
             values = torch.cat([values, values], dim=0)
 
             '''
@@ -202,28 +193,28 @@ class Generative(Policy):
 
             target_q1, target_q2 = self.critic_target(torch.cat((tiled_state_batch, target_actions), 1))
             target_action_values = self.target_policy_q(
-                target_q1.view(batch_size, self.num_outputs, -1),
-                target_q2.view(batch_size, self.num_outputs, -1)
+                target_q1.view(batch_size, self.actor_samples, -1),
+                target_q2.view(batch_size, self.actor_samples, -1)
             )
 
             random_actions = torch.rand_like(target_actions) * 2 - 1
             random_q1, random_q2 = self.critic_target(torch.cat((tiled_state_batch, random_actions), 1))
             target_random_values = self.target_policy_q(
-                random_q1.view(batch_size, self.num_outputs, -1),
-                random_q2.view(batch_size, self.num_outputs, -1)
+                random_q1.view(batch_size, self.actor_samples, -1),
+                random_q2.view(batch_size, self.actor_samples, -1)
             )
 
-            target_actions = target_actions.view(batch_size, self.num_outputs, -1)
-            random_actions = random_actions.view(batch_size, self.num_outputs, -1)
+            target_actions = target_actions.view(batch_size, self.actor_samples, -1)
+            random_actions = random_actions.view(batch_size, self.actor_samples, -1)
 
             target_actions = torch.cat([target_actions, random_actions], dim=0)
             target_action_values = torch.cat([target_action_values, target_random_values], dim=0)
 
             # (batch_size, 1) -> (batch_size, N, 1)
-            values = values.unsqueeze(-1).expand(-1, self.num_outputs, -1)
+            values = values.unsqueeze(-1).expand(-1, self.actor_samples, -1)
             improvement = (target_action_values > values).view(-1, 1)  # Choose everything over value
 
-            weighting_improvement = improvement.view(batch_size * 2, self.num_outputs)
+            weighting_improvement = improvement.view(batch_size * 2, self.actor_samples)
             state_improvement = improvement.expand(-1, tiled_state_batch.shape[1])
             action_improvement = improvement.expand(-1, self.action_dim)
 
@@ -234,6 +225,9 @@ class Generative(Policy):
             if self.target_policy == 'linear':
                 weighting = (target_action_values[weighting_improvement] - values[weighting_improvement])
                 weighting = weighting / weighting.sum(-1, keepdim=True)
+            elif self.target_policy == 'exponential':
+                weighting = torch.exp(target_action_values[weighting_improvement] - values[weighting_improvement])
+                weighting = torch.clamp(weighting, max=20)
             elif self.target_policy == 'boltzman':
                 weighting = (target_action_values[weighting_improvement] - values[weighting_improvement])
                 weighting = F.softmax((1./self.temp) * weighting, dim=1)
@@ -249,6 +243,7 @@ class Generative(Policy):
 
             self.actor_optim.zero_grad()
             policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1)
             self.actor_optim.step()
 
             return policy_loss.item()

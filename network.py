@@ -147,20 +147,20 @@ class StochasticActor(nn.Module):
     def __init__(self, num_inputs, action_dim, n_basis_functions):
         super(StochasticActor, self).__init__()
 
-        hidden_size = int(400 / action_dim)
+        hidden_size = 400
 
         self.hidden_size = hidden_size
         self.action_dim = action_dim
-        self.l1 = nn.Linear(num_inputs, self.hidden_size * self.action_dim)
+        self.l1 = nn.Linear(num_inputs, self.hidden_size)
         self.phi = CosineBasisLinear(n_basis_functions, self.hidden_size)
-        self.l2 = nn.Linear(self.hidden_size * self.action_dim, 200)
+        self.l2 = nn.Linear(self.hidden_size, 200)
         self.l3 = nn.Linear(200, self.action_dim)
 
-    def forward(self, state, taus, actions):
+    def forward(self, state, tau, actions):
         # batch x ~400
         state_embedding = F.leaky_relu(self.l1(state))
         # batch x ~400
-        noise_embedding = F.leaky_relu(self.phi(taus)).view(-1, self.hidden_size * self.action_dim)
+        noise_embedding = F.leaky_relu(self.phi(tau)).view(-1, self.hidden_size)
 
         hadamard_product = state_embedding * noise_embedding
 
